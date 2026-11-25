@@ -19,7 +19,15 @@ const MAX_DOWNLOAD_SECONDS = num('MAX_DOWNLOAD_MINUTES', 30) * 60; // longest vi
 const SB_API = 'https://sponsor.ajay.app/api/skipSegments';
 const dir = path.dirname(fileURLToPath(import.meta.url));
 
-Platform.shim.eval = async (data) => new Function(data.output)();
+// Runs YouTube's player script to unscramble stream URLs (signature "sig" and throttling "n" values).
+// Newer youtubei.js versions pass the values to solve in `env` and expect them back; without this the URLs stay scrambled and googlevideo refuses them.
+Platform.shim.eval = async (data, env = {}) => {
+  const props = [];
+  if (env.n) props.push(`n: exportedVars.nFunction(${JSON.stringify(env.n)})`);
+  if (env.sig) props.push(`sig: exportedVars.sigFunction(${JSON.stringify(env.sig)})`);
+  if (!props.length) return new Function(data.output)();
+  return new Function(`${data.output}\nreturn { ${props.join(', ')} }`)();
+};
 let yt = await Innertube.create();
 // Some sessions / PO-token minters are refused by googlevideo (403 on every stream) and stay that way until restart: rebuild both.
 let renewing;
@@ -168,8 +176,9 @@ async function proxy(req, res, id, video, mime) {
       if (up.ok) break;
       throw new Error(`upstream ${up.status}`);
     } catch (err) {
+      console.error(`[stream ${id}] attempt ${attempt} failed:`, err);
       videos.delete(id);
-      if (!/^upstream|No valid URL/.test(err.message)) throw err;
+      if (!/^upstream|No valid URL|PO token|decipher|signature|fetch failed/i.test(err.message)) throw err;
       if (attempt === 4) return res.status(502).json({ error: err.message });
       if (attempt >= 2) await renewSession();
     }
@@ -220,6 +229,7 @@ async function download(req, res, id) {
     head(a.mime_type.split(';')[0], a.mime_type.startsWith('audio/webm') ? 'webm' : 'm4a', sizeOf(a, e));
     await feed(await urlFor(id, e, a), sizeOf(a, e), res, res);
   } catch (err) {
+    console.error(`[download ${id}] failed:`, err);
     videos.delete(id);
     if (res.headersSent) res.destroy(); else res.status(502).json({ error: err.message });
   }
@@ -227,7 +237,7 @@ async function download(req, res, id) {
 
 // ---- routes ------------------------------------------------------------
 const api = express.Router();
-const wrap = (fn) => (req, res) => fn(req, res).catch((e) => res.status(500).json({ error: e.message }));
+const wrap = (fn) => (req, res) => fn(req, res).catch((e) => { console.error(`[${req.path}] error:`, e); if (res.headersSent) res.destroy(); else res.status(500).json({ error: e.message }); });
 
 api.get('/search', wrap(async (req, res) => {
   const { q, type } = req.query;
